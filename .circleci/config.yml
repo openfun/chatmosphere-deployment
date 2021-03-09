@@ -1,0 +1,100 @@
+version: 2.1
+jobs:
+  # Git jobs
+  # Check that the git history is clean and complies with our expectations
+  lint-git:
+    docker:
+      - image: circleci/python:3.8-buster
+    working_directory: ~/fun
+    steps:
+      - checkout
+      # Make sure the changes don't add a "print" statement to the code base.
+      # We should exclude the ".circleci" folder from the search as the very command that checks
+      # the absence of "print" is including a "print(" itself.
+      - run:
+          name: Enforce absence of print statements in code
+          command: |
+            ! git diff origin/main..HEAD -- . ':(exclude).circleci' | grep "print("
+      - run:
+          name: Check absence of fixup commits
+          command: |
+            ! git log | grep 'fixup!'
+      - run:
+          name: Install gitlint
+          command: |
+            pip install --user gitlint
+      - run:
+          name: Lint commit messages added to main
+          command: |
+            ~/.local/bin/gitlint --commits origin/main..HEAD
+
+  build-app:
+    docker: 
+      - image: cimg/node:14.16
+    working_directory: ~/fun
+    steps:
+      - checkout
+      - run:
+          name: Download and unzip chatmosphere
+          command: |
+            source ./.circleci/version.sh
+            curl -sLo chatmosphere.tgz https://github.com/Chatmosphere/chatmosphere-app/archive/${CHATMOSPHERE_VERSION}.tar.gz
+            mkdir chatmosphere
+            tar xzf chatmosphere.tgz -C chatmosphere --strip-components 1
+
+      - run:
+          name: Copy configuration filters
+          command: |
+            cp -f ./.circleci/files/.env.app chatmosphere/.env.app
+            cp ./.circleci/files/serverConfig.ts chatmosphere/src/serverConfig.ts
+
+      - run:
+          name: Build chatmosphere application
+          command: |
+            cd chatmosphere
+            CI=false npm install
+            CI=false npm run build:app
+
+      - persist_to_workspace:
+          root: ~/fun/
+          paths:
+            - chatmosphere/app/*
+
+  deploy-app:
+    docker:
+      - image: cimg/python:3.8
+    working_directory: ~/fun
+    steps:
+      - attach_workspace:
+          at: ~/fun
+
+      - run:
+          name: install aws cli
+          command: |
+            pip install -U pip
+            pip install awscli
+      - run:
+          name: deploy application to AWS
+          command: |
+            cd chatmosphere
+            aws s3 sync app/ s3://${BUCKET_NAME} --delete --exclude .git --exclude README.md
+            aws cloudfront create-invalidation --distribution-id ${DISTRIBUTION_ID} --paths '/*'
+
+
+workflows:
+  chatmosphere:
+    jobs:
+      # Git jobs
+      #
+      # Check validity of git history
+      - lint-git
+      - build-app:
+          requires:
+            - lint-git
+      - hold: # <<< A job that will require manual approval in the CircleCI web application.
+          type: approval # <<< This key-value pair will set your workflow to a status of "On Hold"
+          requires: # We only run the "hold" job when build-app has succeeded
+           - build-app
+      - deploy-app:
+          requires:
+            - hold
